@@ -1,0 +1,12 @@
+# Python environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Generated videos
+videos/output_*.mp4
+
+# Local configuration
+.env
+.vscode/
