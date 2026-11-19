@@ -1,0 +1,44 @@
+{
+    "model": "SCRFD 10G",
+    "images_tested": 30,
+    "ground_truth_faces": 100,
+    "best_experiment": "RGB",
+    "rgb_input": true,
+    "clahe_enabled": false,
+    "best_confidence": 0.7,
+    "best_nms_threshold": 0.3,
+    "iou_threshold": 0.5,
+    "minimum_prediction_confidence": 0.05,
+    "true_positives": 74,
+    "false_positives": 3,
+    "false_negatives": 26,
+    "precision_percent": 96.1,
+    "recall_percent": 74.0,
+    "f1_percent": 83.62,
+    "AP50_percent": 76.99,
+    "AP75_percent": 3.67,
+    "AP50_95_percent": 22.8,
+    "mean_matched_iou": 0.6722,
+    "possible_localization_errors": 3,
+    "average_detection_ms": 130.55,
+    "average_inference_ms": 99.2,
+    "detector_only_fps": 7.66,
+    "configurations_tested": 456,
+    "face_size_analysis": {
+        "small_under_32px": {
+            "total": 36,
+            "matched": 13,
+            "recall_percent": 36.11
+        },
+        "medium_32_to_95px": {
+            "total": 57,
+            "matched": 54,
+            "recall_percent": 94.74
+        },
+        "large_96px_and_above": {
+            "total": 7,
+            "matched": 7,
+            "recall_percent": 100.0
+        }
+    }
+}

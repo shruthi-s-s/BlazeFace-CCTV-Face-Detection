@@ -1,15 +1,12 @@
 
-
-from pathlib import Path
-from collections import defaultdict
-from fractions import Fraction
-
-import csv
+import time
 import json
+import csv
 import queue
 import threading
-import time
 import tkinter as tk
+
+from pathlib import Path
 
 import av
 import numpy as np
@@ -20,85 +17,49 @@ from scipy.optimize import linear_sum_assignment
 
 
 # ==========================================
-# 1. CONFIGURATION
+# CONFIGURATION
 # ==========================================
 
 BASE = Path(__file__).resolve().parent
 
+MODEL_PATH = BASE / "models" / "det_10g.onnx"
 VIDEO_PATH = BASE / "videos" / "input.mp4"
-
-MODEL_CANDIDATES = [
-    BASE / "models" / "2.5g_bnkps.onnx",
-    BASE / "models" / "scrfd_2.5g_bnkps.onnx",
-]
-
-MODEL_PATH = next(
-    (p for p in MODEL_CANDIDATES if p.is_file()),
-    MODEL_CANDIDATES[0]
-)
-
-OUTPUT_DIR = BASE / "videos" / "live_results"
+OUTPUT_DIR = BASE / "videos" / "live_results_10g"
 
 MODEL_SIZE = 640
 
-HIGH_CONF = 0.55
-LOW_CONF = 0.25
+HIGH_CONF = 0.50
+LOW_CONF = 0.05
 
 NMS_THRESHOLD = 0.40
 
-# Detection every 2 frames.
-# Tracking still processes EVERY frame.
-# Change to 1 for detection on every frame.
+USE_RGB_INPUT = True
+ENABLE_CLAHE = False
+ENABLE_ADAPTIVE_TILING = False
+
 DETECTION_INTERVAL = 2
 
-MIN_TRACK_HITS = 3
-MAX_LOST_FRAMES = 36
+MIN_TRACK_HITS = 2
+MAX_LOST_FRAMES = 30
 MAX_VISIBLE_MISSED = 3
 
-MIN_FACE_SIZE = 48
-MIN_BLUR_VARIANCE = 55.0
-
-MIN_BRIGHTNESS = 45
-MAX_BRIGHTNESS = 215
+MIN_FACE_SIZE = 40
+MIN_BLUR_VARIANCE = 45.0
 
 BEST_FRAMES_PER_TRACK = 5
 MIN_BEST_FRAME_GAP = 5
 
 PREVIEW_MAX_WIDTH = 1100
 
-# Optional region of interest:
-# None = entire video
-# Example: (100, 100, 1100, 650)
-ROI = None
-
-ENABLE_ADAPTIVE_TILING = False
-TILE_SIZE = 640
-TILE_OVERLAP = 0.25
-MAX_TILES = 6
-
-ENABLE_CLAHE = False
-
-# Process sample video once.
-LOOP_VIDEO = False
-
-# Enable if you need annotated MP4.
-SAVE_ANNOTATED_VIDEO = False
-
-# IMPORTANT:
-# This version NEVER intentionally skips
-# a decoded video frame.
-SKIP_FRAMES = False
-
 
 # ==========================================
-# 2. BOX UTILITIES
+# IOU
 # ==========================================
 
 def calculate_iou(a, b):
 
     x1 = max(a[0], b[0])
     y1 = max(a[1], b[1])
-
     x2 = min(a[2], b[2])
     y2 = min(a[3], b[3])
 
@@ -123,123 +84,102 @@ def calculate_iou(a, b):
     )
 
 
-def inside_roi(box):
+# ==========================================
+# NMS
+# ==========================================
 
-    if ROI is None:
-        return True
-
-    cx = (box[0] + box[2]) / 2
-    cy = (box[1] + box[3]) / 2
-
-    return (
-        ROI[0] <= cx <= ROI[2]
-        and ROI[1] <= cy <= ROI[3]
-    )
-
-
-def non_max_suppression(detections):
+def non_max_suppression(
+    detections,
+    threshold=NMS_THRESHOLD
+):
 
     if not detections:
         return []
 
-    detections = sorted(
-        detections,
-        key=lambda item: item[1],
-        reverse=True
+    boxes = np.asarray(
+        [d[0] for d in detections]
     )
 
-    selected = []
+    scores = np.asarray(
+        [d[1] for d in detections]
+    )
 
-    while detections:
+    x1, y1, x2, y2 = boxes.T
 
-        best = detections.pop(0)
-        selected.append(best)
+    areas = (
+        np.maximum(0, x2 - x1)
+        * np.maximum(0, y2 - y1)
+    )
 
-        detections = [
-            item
-            for item in detections
-            if calculate_iou(
-                best[0],
-                item[0]
-            ) < NMS_THRESHOLD
-        ]
+    order = np.argsort(-scores)
 
-    return selected
+    keep = []
+
+    while order.size:
+
+        i = order[0]
+
+        keep.append(detections[i])
+
+        rest = order[1:]
+
+        if not rest.size:
+            break
+
+        intersection = (
+            np.maximum(
+                0,
+                np.minimum(x2[i], x2[rest])
+                - np.maximum(x1[i], x1[rest])
+            )
+            *
+            np.maximum(
+                0,
+                np.minimum(y2[i], y2[rest])
+                - np.maximum(y1[i], y1[rest])
+            )
+        )
+
+        union = (
+            areas[i] + areas[rest]
+            - intersection
+        )
+
+        iou = intersection / np.maximum(
+            union, 1e-6
+        )
+
+        order = rest[iou <= threshold]
+
+    return keep
 
 
 # ==========================================
-# 3. SCRFD PREPROCESSING
-# ==========================================
-
-def preprocess_frame(frame_array):
-
-    height, width = frame_array.shape[:2]
-
-    scale = min(
-        MODEL_SIZE / width,
-        MODEL_SIZE / height
-    )
-
-    new_width = max(
-        1,
-        round(width * scale)
-    )
-
-    new_height = max(
-        1,
-        round(height * scale)
-    )
-
-    temporary_frame = av.VideoFrame.from_ndarray(
-        np.ascontiguousarray(frame_array),
-        format="bgr24"
-    )
-
-    resized = temporary_frame.reformat(
-        width=new_width,
-        height=new_height,
-        format="bgr24"
-    ).to_ndarray()
-
-    canvas = np.zeros(
-        (MODEL_SIZE, MODEL_SIZE, 3),
-        dtype=np.uint8
-    )
-
-    canvas[:new_height, :new_width] = resized
-
-    tensor = (
-        canvas.astype(np.float32) - 127.5
-    ) / 128.0
-
-    tensor = np.ascontiguousarray(
-        tensor.transpose(2, 0, 1)[None]
-    )
-
-    return tensor, scale
-
-
-# ==========================================
-# 4. SCRFD DETECTOR
+# SCRFD 10G DETECTOR
 # ==========================================
 
 class SCRFDDetector:
 
-    def __init__(self):
+    def __init__(
+        self,
+        model_path=MODEL_PATH
+    ):
 
-        if not MODEL_PATH.is_file():
+        if not Path(model_path).exists():
+
             raise FileNotFoundError(
-                f"Model not found: {MODEL_PATH}"
+                f"Model not found: {model_path}"
             )
 
         options = ort.SessionOptions()
 
         options.graph_optimization_level = (
-            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            ort.GraphOptimizationLevel
+            .ORT_ENABLE_ALL
         )
 
         self.session = ort.InferenceSession(
-            str(MODEL_PATH),
+            str(model_path),
             sess_options=options,
             providers=["CPUExecutionProvider"]
         )
@@ -249,21 +189,203 @@ class SCRFDDetector:
         )
 
         self.output_names = [
-            output.name
-            for output in self.session.get_outputs()
+            out.name
+            for out in self.session.get_outputs()
         ]
+
+        self.anchor_cache = {}
 
         self.inference_count = 0
         self.inference_time = 0.0
 
-    def detect_array(
+        print("\nSCRFD detector initialized")
+        print("Model:", model_path)
+        print("Provider:", self.session.get_providers())
+        print("Input:", self.input_name)
+
+        for output in self.session.get_outputs():
+
+            print(
+                "Output:",
+                output.name,
+                output.shape
+            )
+
+    def preprocess(
         self,
-        frame_array,
-        offset=(0, 0)
+        rgb,
+        rgb_input=True,
+        clahe=False
     ):
 
-        tensor, scale = preprocess_frame(
-            frame_array
+        height, width = rgb.shape[:2]
+
+        scale = min(
+            MODEL_SIZE / width,
+            MODEL_SIZE / height
+        )
+
+        new_width = max(
+            1, int(width * scale)
+        )
+
+        new_height = max(
+            1, int(height * scale)
+        )
+
+        if clahe:
+
+            from skimage.exposure import equalize_adapthist
+
+            rgb = np.uint8(
+                np.clip(
+                    equalize_adapthist(
+                        rgb,
+                        clip_limit=0.02
+                    ) * 255,
+                    0,
+                    255
+                )
+            )
+
+        resized = np.asarray(
+            Image.fromarray(rgb).resize(
+                (new_width, new_height),
+                Image.Resampling.BILINEAR
+            )
+        )
+
+        if not rgb_input:
+
+            resized = resized[:, :, ::-1]
+
+        canvas = np.zeros(
+            (MODEL_SIZE, MODEL_SIZE, 3),
+            dtype=np.uint8
+        )
+
+        canvas[
+            :new_height,
+            :new_width
+        ] = resized
+
+        tensor = (
+            canvas.astype(np.float32)
+            - 127.5
+        ) / 128.0
+
+        tensor = np.ascontiguousarray(
+            tensor.transpose(2, 0, 1)[None]
+        )
+
+        return (
+            tensor,
+            new_width / width,
+            new_height / height
+        )
+
+    def decode_outputs(self, raw_outputs):
+
+        outputs = {}
+
+        for output in raw_outputs:
+
+            arr = np.asarray(output)
+
+            if arr.ndim < 2:
+                continue
+
+            channels = arr.shape[-1]
+
+            if channels not in (1, 4, 10):
+                continue
+
+            arr = arr.reshape(-1, channels)
+
+            for stride in (8, 16, 32):
+
+                expected = (
+                    2 * (MODEL_SIZE // stride) ** 2
+                )
+
+                if len(arr) != expected:
+                    continue
+
+                prefix = {
+                    1: "score",
+                    4: "bbox",
+                    10: "kps"
+                }[channels]
+
+                outputs[
+                    f"{prefix}_{stride}"
+                ] = arr
+
+        for stride in (8, 16, 32):
+
+            for prefix in ("score", "bbox"):
+
+                key = f"{prefix}_{stride}"
+
+                if key not in outputs:
+
+                    raise ValueError(
+                        f"Missing output: {key}. "
+                        f"Model shapes: "
+                        f"{[o.shape for o in raw_outputs]}"
+                    )
+
+        return outputs
+
+    def get_anchors(self, stride, count):
+
+        key = (stride, count)
+
+        if key in self.anchor_cache:
+
+            return self.anchor_cache[key]
+
+        grid = MODEL_SIZE // stride
+
+        yy, xx = np.mgrid[:grid, :grid]
+
+        centers = np.stack(
+            (xx, yy),
+            axis=-1
+        ).reshape(-1, 2)
+
+        if count % len(centers):
+
+            raise ValueError(
+                "Invalid anchor count"
+            )
+
+        centers = np.repeat(
+            centers,
+            count // len(centers),
+            axis=0
+        ).astype(np.float32)
+
+        centers *= stride
+
+        self.anchor_cache[key] = centers
+
+        return centers
+
+    def detect_raw(
+        self,
+        rgb,
+        rgb_input=USE_RGB_INPUT,
+        clahe=ENABLE_CLAHE,
+        minimum_confidence=LOW_CONF
+    ):
+
+        height, width = rgb.shape[:2]
+
+        tensor, sx, sy = self.preprocess(
+            rgb,
+            rgb_input,
+            clahe
         )
 
         start = time.perf_counter()
@@ -279,11 +401,8 @@ class SCRFDDetector:
 
         self.inference_count += 1
 
-        outputs = dict(
-            zip(
-                self.output_names,
-                raw_outputs
-            )
+        outputs = self.decode_outputs(
+            raw_outputs
         )
 
         detections = []
@@ -292,165 +411,88 @@ class SCRFDDetector:
 
             scores = outputs[
                 f"score_{stride}"
-            ][0].reshape(-1)
+            ].reshape(-1)
 
-            bbox = outputs[
+            distances = outputs[
                 f"bbox_{stride}"
-            ][0].reshape(-1, 4)
+            ].reshape(-1, 4)
 
-            grid_size = MODEL_SIZE // stride
-
-            yy, xx = np.mgrid[
-                :grid_size,
-                :grid_size
-            ]
-
-            centers = np.stack(
-                (xx, yy),
-                axis=-1
-            ).reshape(-1, 2)
-
-            anchors_per_cell = (
-                len(scores) // len(centers)
-            )
-
-            centers = np.repeat(
-                centers,
-                anchors_per_cell,
-                axis=0
-            )
-
-            centers = (
-                centers.astype(np.float32)
-                * stride
+            anchors = self.get_anchors(
+                stride,
+                len(scores)
             )
 
             selected = np.where(
-                scores >= LOW_CONF
+                np.isfinite(scores)
+                & (scores >= minimum_confidence)
+                & (scores <= 1)
             )[0]
 
-            if len(selected) == 0:
+            if not selected.size:
                 continue
 
-            distances = (
-                bbox[selected] * stride
+            c = anchors[selected]
+
+            d = (
+                distances[selected] * stride
             )
 
-            center = centers[selected]
-
             boxes = np.column_stack([
-                center[:, 0] - distances[:, 0],
-                center[:, 1] - distances[:, 1],
-                center[:, 0] + distances[:, 2],
-                center[:, 1] + distances[:, 3]
+                c[:, 0] - d[:, 0],
+                c[:, 1] - d[:, 1],
+                c[:, 0] + d[:, 2],
+                c[:, 1] + d[:, 3]
             ])
 
-            boxes /= scale
+            boxes[:, [0, 2]] /= sx
+            boxes[:, [1, 3]] /= sy
 
             boxes[:, [0, 2]] = np.clip(
                 boxes[:, [0, 2]],
                 0,
-                frame_array.shape[1]
+                width
             )
 
             boxes[:, [1, 3]] = np.clip(
                 boxes[:, [1, 3]],
                 0,
-                frame_array.shape[0]
+                height
             )
 
-            boxes[:, [0, 2]] += offset[0]
-            boxes[:, [1, 3]] += offset[1]
-
-            for box, confidence in zip(
+            for box, score in zip(
                 boxes,
                 scores[selected]
             ):
 
+                if not np.all(np.isfinite(box)):
+                    continue
+
                 if (
-                    box[2] > box[0]
-                    and box[3] > box[1]
-                    and inside_roi(box)
+                    box[2] <= box[0]
+                    or box[3] <= box[1]
                 ):
 
-                    detections.append((
-                        box.astype(np.float64),
-                        float(confidence)
-                    ))
+                    continue
+
+                detections.append((
+                    box.astype(np.float64),
+                    float(score)
+                ))
 
         return detections
 
-    def detect(self, frame):
+    def detect_rgb(self, rgb):
 
-        frame_array = frame.to_ndarray(
-            format="bgr24"
-        )
-
-        detections = self.detect_array(
-            frame_array
-        )
-
-        if ENABLE_ADAPTIVE_TILING:
-
-            height, width = (
-                frame_array.shape[:2]
-            )
-
-            step = max(
-                1,
-                int(
-                    TILE_SIZE
-                    * (1 - TILE_OVERLAP)
-                )
-            )
-
-            tile_count = 0
-
-            for y in range(
-                0,
-                height,
-                step
-            ):
-
-                for x in range(
-                    0,
-                    width,
-                    step
-                ):
-
-                    if tile_count >= MAX_TILES:
-                        break
-
-                    tile = frame_array[
-                        y:min(y + TILE_SIZE, height),
-                        x:min(x + TILE_SIZE, width)
-                    ]
-
-                    if (
-                        tile.shape[0] < 100
-                        or tile.shape[1] < 100
-                    ):
-                        continue
-
-                    detections.extend(
-                        self.detect_array(
-                            tile,
-                            offset=(x, y)
-                        )
-                    )
-
-                    tile_count += 1
-
-                if tile_count >= MAX_TILES:
-                    break
+        raw = self.detect_raw(rgb)
 
         return non_max_suppression(
-            detections
+            raw,
+            NMS_THRESHOLD
         )
 
 
 # ==========================================
-# 5. KALMAN TRACKING UTILITIES
+# KALMAN FILTER
 # ==========================================
 
 def box_to_measurement(box):
@@ -462,87 +504,74 @@ def box_to_measurement(box):
         (y1 + y2) / 2,
         max(1, x2 - x1),
         max(1, y2 - y1)
-    ], dtype=np.float64)
-
-
-def measurement_to_box(values):
-
-    cx, cy, width, height = values[:4]
-
-    width = max(1, width)
-    height = max(1, height)
-
-    return np.array([
-        cx - width / 2,
-        cy - height / 2,
-        cx + width / 2,
-        cy + height / 2
     ])
 
 
-# ==========================================
-# 6. KALMAN TRACK
-# ==========================================
+def measurement_to_box(state):
+
+    cx, cy, w, h = state[:4]
+
+    w = max(1, w)
+    h = max(1, h)
+
+    return np.array([
+        cx - w / 2,
+        cy - h / 2,
+        cx + w / 2,
+        cy + h / 2
+    ])
+
 
 class FaceTrack:
 
-    def __init__(
-        self,
-        track_id,
-        box,
-        confidence,
-        frame_number
-    ):
+    def __init__(self, track_id, detection):
+
+        box, score = detection
 
         self.id = track_id
 
-        self.state = np.zeros(
-            8,
-            dtype=np.float64
-        )
+        self.state = np.zeros(8)
 
-        self.state[:4] = (
-            box_to_measurement(box)
-        )
-
-        self.P = np.diag([
-            100, 100, 100, 100,
-            400, 400, 100, 100
-        ]).astype(np.float64)
+        self.state[:4] = box_to_measurement(box)
 
         self.F = np.eye(8)
-
-        for i in range(4):
-            self.F[i, i + 4] = 1
+        self.F[:4, 4:] = np.eye(4)
 
         self.H = np.zeros((4, 8))
-        self.H[:4, :4] = np.eye(4)
+        self.H[:, :4] = np.eye(4)
+
+        self.P = np.eye(8) * 100
 
         self.Q = np.diag([
             2, 2, 2, 2,
             4, 4, 2, 2
-        ]).astype(np.float64)
+        ])
 
         self.R = np.diag([
             25, 25, 36, 36
-        ]).astype(np.float64)
+        ])
 
         self.hits = 1
         self.missed = 0
 
-        self.confidence = confidence
-        self.last_detection_frame = (
-            frame_number
-        )
+        self.confidence = score
 
-        self.confirmed = False
         self.best_frames = []
+
+    @property
+    def confirmed(self):
+
+        return self.hits >= MIN_TRACK_HITS
+
+    def box(self):
+
+        return measurement_to_box(
+            self.state
+        )
 
     def predict(self):
 
-        self.state = (
-            self.F @ self.state
-        )
+        self.state = self.F @ self.state
 
         self.P = (
             self.F @ self.P @ self.F.T
@@ -550,26 +579,19 @@ class FaceTrack:
         )
 
         self.state[2:4] = np.maximum(
-            self.state[2:4],
-            1
+            self.state[2:4], 1
         )
 
         self.missed += 1
 
-    def correct(
-        self,
-        box,
-        confidence,
-        frame_number
-    ):
+    def update(self, detection):
 
-        measurement = (
-            box_to_measurement(box)
-        )
+        box, score = detection
+
+        z = box_to_measurement(box)
 
         innovation = (
-            measurement
-            - self.H @ self.state
+            z - self.H @ self.state
         )
 
         S = (
@@ -582,14 +604,9 @@ class FaceTrack:
             self.H @ self.P
         ).T
 
-        self.state += (
-            K @ innovation
-        )
+        self.state += K @ innovation
 
-        A = (
-            np.eye(8)
-            - K @ self.H
-        )
+        A = np.eye(8) - K @ self.H
 
         self.P = (
             A @ self.P @ A.T
@@ -597,60 +614,16 @@ class FaceTrack:
         )
 
         self.state[2:4] = np.maximum(
-            self.state[2:4],
-            1
+            self.state[2:4], 1
         )
 
-        self.missed = 0
         self.hits += 1
-
-        self.confidence = confidence
-        self.last_detection_frame = (
-            frame_number
-        )
-
-        if self.hits >= MIN_TRACK_HITS:
-            self.confirmed = True
-
-    def box(self):
-
-        return measurement_to_box(
-            self.state
-        )
-
-    def gating_distance(self, box):
-
-        measurement = (
-            box_to_measurement(box)
-        )
-
-        innovation = (
-            measurement
-            - self.H @ self.state
-        )
-
-        S = (
-            self.H @ self.P @ self.H.T
-            + self.R
-        )
-
-        try:
-
-            result = np.linalg.solve(
-                S,
-                innovation
-            )
-
-            return float(
-                innovation @ result
-            )
-
-        except np.linalg.LinAlgError:
-            return float("inf")
+        self.missed = 0
+        self.confidence = score
 
 
 # ==========================================
-# 7. MULTI-FACE TRACKER
+# MULTI-FACE TRACKING
 # ==========================================
 
 class MultiFaceTracker:
@@ -661,42 +634,16 @@ class MultiFaceTracker:
         self.all_tracks = []
 
         self.next_id = 1
-
         self.matches = 0
-        self.recoveries = 0
-        self.expired = 0
-
-    def add(
-        self,
-        detection,
-        frame_number
-    ):
-
-        box, confidence = detection
-
-        track = FaceTrack(
-            self.next_id,
-            box,
-            confidence,
-            frame_number
-        )
-
-        self.tracks.append(track)
-        self.all_tracks.append(track)
-
-        self.next_id += 1
 
     def associate(
         self,
         track_indices,
         detections,
-        max_cost
+        limit
     ):
 
-        if (
-            not track_indices
-            or not detections
-        ):
+        if not track_indices or not detections:
 
             return (
                 [],
@@ -704,385 +651,208 @@ class MultiFaceTracker:
                 list(range(len(detections)))
             )
 
-        costs = np.full(
-            (
-                len(track_indices),
-                len(detections)
-            ),
+        cost = np.full(
+            (len(track_indices), len(detections)),
             1e6
         )
 
-        for row, index in enumerate(
-            track_indices
-        ):
+        for row, i in enumerate(track_indices):
 
-            track = self.tracks[index]
+            predicted = self.tracks[i].box()
 
-            predicted_box = track.box()
+            p = box_to_measurement(predicted)
 
-            predicted_measurement = (
-                box_to_measurement(
-                    predicted_box
-                )
-            )
-
-            for col, detection in enumerate(
+            for col, (box, score) in enumerate(
                 detections
             ):
 
-                box, confidence = detection
+                d = box_to_measurement(box)
 
-                measurement = (
-                    box_to_measurement(box)
-                )
-
-                distance = np.hypot(
-                    predicted_measurement[0]
-                    - measurement[0],
-                    predicted_measurement[1]
-                    - measurement[1]
-                )
-
-                normalizer = max(
-                    1,
-                    np.hypot(
-                        predicted_measurement[2],
-                        predicted_measurement[3]
-                    )
-                )
-
-                distance /= normalizer
-
-                ratio = max(
-                    predicted_measurement[2]
-                    / measurement[2],
-
-                    measurement[2]
-                    / predicted_measurement[2],
-
-                    predicted_measurement[3]
-                    / measurement[3],
-
-                    measurement[3]
-                    / predicted_measurement[3]
-                )
-
-                overlap = calculate_iou(
-                    predicted_box,
+                iou = calculate_iou(
+                    predicted,
                     box
                 )
 
-                if (
-                    distance > 1.15
-                    or ratio > 2.3
-                ):
-                    continue
-
-                if (
-                    overlap < 0.03
-                    and distance > 0.45
-                ):
-                    continue
-
-                gate = (
-                    36
-                    if track.missed > 2
-                    else 20
+                distance = (
+                    np.linalg.norm(p[:2] - d[:2])
+                    / max(np.linalg.norm(p[2:]), 1)
                 )
 
-                if (
-                    track.gating_distance(box)
-                    > gate
-                ):
-                    continue
-
-                costs[row, col] = (
-                    0.55 * (1 - overlap)
-                    + 0.35 * min(
-                        1,
-                        distance
-                    )
-                    + 0.10 * min(
-                        1,
-                        abs(np.log(ratio))
-                    )
+                ratio = max(
+                    p[2] / d[2],
+                    d[2] / p[2],
+                    p[3] / d[3],
+                    d[3] / p[3]
                 )
 
-        rows, cols = (
-            linear_sum_assignment(costs)
-        )
+                if distance > 1.1 or ratio > 2.5:
+                    continue
+
+                if iou < 0.03 and distance > 0.4:
+                    continue
+
+                value = (
+                    0.60 * (1 - iou)
+                    + 0.30 * min(distance, 1)
+                    + 0.10 * min(abs(np.log(ratio)), 1)
+                )
+
+                if value <= limit:
+
+                    cost[row, col] = value
+
+        rows, cols = linear_sum_assignment(cost)
 
         matches = []
 
         used_tracks = set()
         used_detections = set()
 
-        for row, col in zip(
-            rows,
-            cols
-        ):
+        for row, col in zip(rows, cols):
 
-            if costs[row, col] > max_cost:
+            if cost[row, col] > limit:
                 continue
 
-            track_index = (
-                track_indices[row]
+            track_index = track_indices[row]
+
+            matches.append(
+                (track_index, col)
             )
 
-            matches.append((
-                track_index,
-                col
-            ))
-
-            used_tracks.add(
-                track_index
-            )
-
-            used_detections.add(
-                col
-            )
-
-        unmatched_tracks = [
-            index
-            for index in track_indices
-            if index not in used_tracks
-        ]
-
-        unmatched_detections = [
-            index
-            for index in range(
-                len(detections)
-            )
-            if index not in used_detections
-        ]
+            used_tracks.add(track_index)
+            used_detections.add(col)
 
         return (
             matches,
-            unmatched_tracks,
-            unmatched_detections
+
+            [
+                i for i in track_indices
+                if i not in used_tracks
+            ],
+
+            [
+                j for j in range(len(detections))
+                if j not in used_detections
+            ]
         )
 
-    def apply_match(
-        self,
-        track_index,
-        detection,
-        frame_number
-    ):
-
-        track = (
-            self.tracks[track_index]
-        )
-
-        if (
-            track.missed
-            > DETECTION_INTERVAL
-        ):
-            self.recoveries += 1
-
-        track.correct(
-            *detection,
-            frame_number
-        )
-
-        self.matches += 1
-
-    def update(
-        self,
-        detections,
-        frame_number
-    ):
+    def update(self, detections):
 
         for track in self.tracks:
+
             track.predict()
 
         if detections is not None:
 
             high = [
-                detection
-                for detection in detections
-                if detection[1] >= HIGH_CONF
+                d for d in detections
+                if d[1] >= HIGH_CONF
             ]
 
             low = [
-                detection
-                for detection in detections
-                if (
-                    LOW_CONF
-                    <= detection[1]
-                    < HIGH_CONF
-                )
+                d for d in detections
+                if LOW_CONF <= d[1] < HIGH_CONF
             ]
 
-            confirmed = [
-                i
-                for i, track
-                in enumerate(self.tracks)
-                if track.confirmed
-            ]
+            indices = list(
+                range(len(self.tracks))
+            )
 
-            tentative = [
-                i
-                for i, track
-                in enumerate(self.tracks)
-                if not track.confirmed
-            ]
-
-            matches_1, unmatched, unused_high = (
+            matched, unmatched, unused = (
                 self.associate(
-                    confirmed,
+                    indices,
                     high,
-                    0.82
+                    0.80
                 )
             )
 
-            remaining_high = [
-                high[i]
-                for i in unused_high
+            for i, j in matched:
+
+                self.tracks[i].update(high[j])
+
+                self.matches += 1
+
+            confirmed_unmatched = [
+                i for i in unmatched
+                if self.tracks[i].confirmed
             ]
 
-            matches_2, _, unused_remaining = (
-                self.associate(
-                    tentative,
-                    remaining_high,
-                    0.72
-                )
+            matched_low, _, _ = self.associate(
+                confirmed_unmatched,
+                low,
+                0.68
             )
 
-            for track_index, detection_index in matches_1:
+            for i, j in matched_low:
 
-                self.apply_match(
-                    track_index,
-                    high[detection_index],
-                    frame_number
+                self.tracks[i].update(low[j])
+
+                self.matches += 1
+
+            for j in unused:
+
+                track = FaceTrack(
+                    self.next_id,
+                    high[j]
                 )
 
-            for track_index, detection_index in matches_2:
+                self.next_id += 1
 
-                self.apply_match(
-                    track_index,
-                    remaining_high[
-                        detection_index
-                    ],
-                    frame_number
-                )
+                self.tracks.append(track)
+                self.all_tracks.append(track)
 
-            matches_3, _, _ = (
-                self.associate(
-                    unmatched,
-                    low,
-                    0.70
-                )
-            )
+        self.tracks = [
+            track for track in self.tracks
 
-            for track_index, detection_index in matches_3:
-
-                self.apply_match(
-                    track_index,
-                    low[detection_index],
-                    frame_number
-                )
-
-            for detection_index in unused_remaining:
-
-                self.add(
-                    remaining_high[
-                        detection_index
-                    ],
-                    frame_number
-                )
-
-        alive = []
-
-        for track in self.tracks:
-
-            limit = (
+            if track.missed <= (
                 MAX_LOST_FRAMES
                 if track.confirmed
-                else (
-                    2 * DETECTION_INTERVAL
-                    + 1
-                )
-            )
-
-            if track.missed <= limit:
-                alive.append(track)
-
-            else:
-                self.expired += 1
-
-        self.tracks = alive
-
-        visible = [
-            track
-            for track in self.tracks
-            if (
-                track.confirmed
-                and track.missed
-                <= MAX_VISIBLE_MISSED
+                else 5
             )
         ]
 
-        return visible
+        return [
+            track for track in self.tracks
+
+            if track.confirmed
+            and track.missed <= MAX_VISIBLE_MISSED
+        ]
 
 
 # ==========================================
-# 8. FACE QUALITY
+# BEST FACE FRAME SELECTION
 # ==========================================
 
-def assess_face_quality(
-    image,
-    box,
-    occlusion=0
+def save_best_candidate(
+    track,
+    rgb,
+    frame_number
 ):
 
-    height, width = (
-        image.shape[:2]
+    h, w = rgb.shape[:2]
+
+    x1, y1, x2, y2 = map(
+        int, track.box()
     )
 
-    x1, y1, x2, y2 = [
-        int(round(value))
-        for value in box
-    ]
+    x1 = max(0, x1)
+    y1 = max(0, y1)
 
-    x1 = max(
-        0,
-        min(width - 1, x1)
-    )
-
-    y1 = max(
-        0,
-        min(height - 1, y1)
-    )
-
-    x2 = max(
-        0,
-        min(width, x2)
-    )
-
-    y2 = max(
-        0,
-        min(height, y2)
-    )
+    x2 = min(w, x2)
+    y2 = min(h, y2)
 
     if (
-        x2 - x1 < 3
-        or y2 - y1 < 3
+        x2 - x1 < MIN_FACE_SIZE
+        or y2 - y1 < MIN_FACE_SIZE
     ):
-        return None
 
-    crop = image[
-        y1:y2,
-        x1:x2
-    ]
+        return
 
-    gray = (
-        crop.astype(np.float32)
-        @ np.array([
-            0.299,
-            0.587,
-            0.114
-        ])
-    )
+    crop = rgb[y1:y2, x1:x2]
+
+    gray = crop.astype(np.float32) @ np.array([
+        0.299, 0.587, 0.114
+    ])
 
     laplacian = (
         gray[:-2, 1:-1]
@@ -1092,111 +862,50 @@ def assess_face_quality(
         - 4 * gray[1:-1, 1:-1]
     )
 
-    blur = float(
-        np.var(laplacian)
-    )
+    blur = float(np.var(laplacian))
+    brightness = float(gray.mean())
 
-    brightness = float(
-        gray.mean()
-    )
-
-    size = min(
-        crop.shape[:2]
-    )
-
-    eligible = (
-        size >= MIN_FACE_SIZE
-        and blur >= MIN_BLUR_VARIANCE
-        and MIN_BRIGHTNESS
-        <= brightness
-        <= MAX_BRIGHTNESS
-        and occlusion < 0.35
-    )
-
-    score = (
-        0.35 * min(
-            1,
-            size / 120
-        )
-
-        + 0.40 * min(
-            1,
-            blur / 250
-        )
-
-        + 0.25 * max(
-            0,
-            1 - abs(
-                brightness - 128
-            ) / 128
-        )
-    )
-
-    score *= (
-        1 - min(
-            1,
-            occlusion
-        )
-    )
-
-    return {
-        "eligible": eligible,
-        "score": float(score),
-        "blur": blur,
-        "brightness": brightness,
-        "size": size,
-        "crop": crop.copy()
-    }
-
-
-# ==========================================
-# 9. BEST FRAME SELECTION
-# ==========================================
-
-def update_best_frames(
-    track,
-    quality,
-    frame_number
-):
-
-    if (
-        quality is None
-        or not quality["eligible"]
-    ):
+    if blur < MIN_BLUR_VARIANCE:
         return
 
+    if not 40 <= brightness <= 220:
+        return
+
+    score = (
+        0.40 * min(blur / 250, 1)
+        + 0.35 * min(min(crop.shape[:2]) / 120, 1)
+        + 0.25 * track.confidence
+    )
+
     nearby = [
-        item
-        for item in track.best_frames
+        item for item in track.best_frames
+
         if abs(
-            item["frame"]
-            - frame_number
+            item["frame"] - frame_number
         ) < MIN_BEST_FRAME_GAP
     ]
 
     if nearby:
 
-        best_nearby = max(
-            item["score"]
-            for item in nearby
-        )
+        if max(
+            item["score"] for item in nearby
+        ) >= score:
 
-        if (
-            best_nearby
-            >= quality["score"]
-        ):
             return
 
+        remove = {
+            item["frame"] for item in nearby
+        }
+
         track.best_frames = [
-            item
-            for item in track.best_frames
-            if item not in nearby
+            item for item in track.best_frames
+            if item["frame"] not in remove
         ]
 
     track.best_frames.append({
         "frame": frame_number,
-        "score": quality["score"],
-        "crop": quality["crop"]
+        "score": score,
+        "crop": crop.copy()
     })
 
     track.best_frames.sort(
@@ -1205,14 +914,12 @@ def update_best_frames(
     )
 
     track.best_frames = (
-        track.best_frames[
-            :BEST_FRAMES_PER_TRACK
-        ]
+        track.best_frames[:BEST_FRAMES_PER_TRACK]
     )
 
 
 # ==========================================
-# 10. LIVE PREVIEW
+# LIVE PREVIEW
 # ==========================================
 
 class LivePreview:
@@ -1222,43 +929,32 @@ class LivePreview:
         self.root = tk.Tk()
 
         self.root.title(
-            "SCRFD LIVE PREVIEW - NO FRAME SKIPPING"
+            "SCRFD 10G - CPU Face Tracking"
         )
 
-        self.root.configure(
-            bg="#171717"
-        )
+        self.root.configure(bg="#171717")
 
-        self.image_label = tk.Label(
+        self.label = tk.Label(
             self.root,
             bg="black"
         )
 
-        self.image_label.pack(
-            padx=8,
-            pady=8
-        )
+        self.label.pack(padx=8, pady=8)
 
         self.status = tk.Label(
             self.root,
-            text="Starting...",
+            text="Initializing...",
             fg="white",
-            bg="#171717",
-            font=("Arial", 11)
+            bg="#171717"
         )
 
-        self.status.pack(
-            pady=5
-        )
+        self.status.pack(pady=8)
 
-        # Unbounded queue preserves every
-        # processed preview frame.
-        self.frames = queue.Queue()
+        self.frames = queue.Queue(maxsize=8)
 
-        self.stop_event = (
-            threading.Event()
-        )
+        self.stop_event = threading.Event()
 
+        self.displayed = 0
         self.photo = None
 
         self.root.protocol(
@@ -1273,761 +969,351 @@ class LivePreview:
 
         self.worker.start()
 
-        self.root.after(
-            10,
-            self.refresh
-        )
+        self.root.after(5, self.refresh)
 
-    def put(
-        self,
-        image,
-        message
-    ):
+    def put(self, image, status):
 
-        self.frames.put((
-            image,
-            message
-        ))
+        while not self.stop_event.is_set():
+
+            try:
+
+                self.frames.put(
+                    (image, status),
+                    timeout=0.1
+                )
+
+                return True
+
+            except queue.Full:
+
+                continue
+
+        return False
 
     def process(self):
 
         try:
-
-            detector = SCRFDDetector()
 
             OUTPUT_DIR.mkdir(
                 parents=True,
                 exist_ok=True
             )
 
-            run_number = 0
+            detector = SCRFDDetector()
 
-            while not self.stop_event.is_set():
+            tracker = MultiFaceTracker()
 
-                run_number += 1
+            processed = 0
+            decoded = 0
+            detection_runs = 0
 
-                tracker = (
-                    MultiFaceTracker()
-                )
+            detection_time = 0.0
 
-                source = av.open(
-                    str(VIDEO_PATH)
-                )
+            rows = []
 
-                stream = (
-                    source.streams.video[0]
-                )
+            with av.open(str(VIDEO_PATH)) as source:
 
                 fps = float(
-                    stream.average_rate
+                    source.streams.video[0].average_rate
                     or 24
                 )
 
-                interval = (
-                    1.0 / fps
-                )
+                start = time.perf_counter()
 
-                counters = defaultdict(int)
-                durations = defaultdict(float)
+                for number, frame in enumerate(
+                    source.decode(video=0)
+                ):
 
-                tracking_rows = []
+                    if self.stop_event.is_set():
+                        break
 
-                video_out = None
-                output_stream = None
+                    decoded += 1
 
-                if SAVE_ANNOTATED_VIDEO:
+                    target = start + number / fps
 
-                    video_out = av.open(
-                        str(
-                            OUTPUT_DIR
-                            / f"preview_run_{run_number}.mp4"
-                        ),
-                        mode="w"
+                    wait = target - time.perf_counter()
+
+                    if wait > 0:
+
+                        time.sleep(wait)
+
+                    rgb = frame.to_ndarray(
+                        format="rgb24"
                     )
 
-                    output_stream = (
-                        video_out.add_stream(
-                            "libx264",
-                            rate=(
-                                stream.average_rate
-                                or Fraction(24, 1)
-                            ),
-                            options={
-                                "preset": "ultrafast",
-                                "crf": "23"
-                            }
+                    detections = None
+
+                    if number % DETECTION_INTERVAL == 0:
+
+                        t0 = time.perf_counter()
+
+                        detections = detector.detect_rgb(rgb)
+
+                        detection_time += (
+                            time.perf_counter() - t0
                         )
+
+                        detection_runs += 1
+
+                    tracks = tracker.update(
+                        detections
                     )
 
-                    output_stream.width = (
-                        stream.width
+                    image = Image.fromarray(rgb)
+
+                    draw = ImageDraw.Draw(image)
+
+                    for track in tracks:
+
+                        if track.missed == 0:
+
+                            save_best_candidate(
+                                track,
+                                rgb,
+                                number
+                            )
+
+                        x1, y1, x2, y2 = map(
+                            int,
+                            track.box()
+                        )
+
+                        x1 = max(0, x1)
+                        y1 = max(0, y1)
+
+                        x2 = min(image.width - 1, x2)
+                        y2 = min(image.height - 1, y2)
+
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+
+                        draw.rectangle(
+                            (x1, y1, x2, y2),
+                            outline="#00ff66",
+                            width=2
+                        )
+
+                        draw.text(
+                            (x1, max(0, y1 - 15)),
+
+                            f"ID {track.id} "
+                            f"{track.confidence:.2f}",
+
+                            fill="#00ff66",
+                            stroke_width=1,
+                            stroke_fill="black"
+                        )
+
+                        rows.append([
+                            number,
+                            track.id,
+                            x1, y1, x2, y2,
+                            track.confidence
+                        ])
+
+                    processed += 1
+
+                    image.thumbnail(
+                        (PREVIEW_MAX_WIDTH, 1000)
                     )
 
-                    output_stream.height = (
-                        stream.height
+                    elapsed = (
+                        time.perf_counter() - start
                     )
 
-                    output_stream.pix_fmt = (
-                        "yuv420p"
+                    effective_fps = (
+                        processed / max(elapsed, 1e-6)
                     )
 
-                start = (
-                    time.perf_counter()
-                )
-
-                try:
-
-                    for frame_number, frame in enumerate(
-                        source.decode(video=0)
-                    ):
-
-                        if self.stop_event.is_set():
-                            break
-
-                        # ==================================
-                        # NO FRAME SKIPPING
-                        # ==================================
-
-                        target = (
-                            start
-                            + frame_number * interval
-                        )
-
-                        wait = (
-                            target
-                            - time.perf_counter()
-                        )
-
-                        if wait > 0:
-                            time.sleep(wait)
-
-                        # No lag-based continue.
-                        # Every decoded frame proceeds.
-
-                        frame_start = (
-                            time.perf_counter()
-                        )
-
-                        detections = None
-
-                        if (
-                            frame_number
-                            % DETECTION_INTERVAL == 0
-                        ):
-
-                            detections = (
-                                detector.detect(frame)
-                            )
-
-                            counters[
-                                "detection_frames"
-                            ] += 1
-
-                        detection_end = (
-                            time.perf_counter()
-                        )
-
-                        tracks = tracker.update(
-                            detections,
-                            frame_number
-                        )
-
-                        tracking_end = (
-                            time.perf_counter()
-                        )
-
-                        rgb = frame.to_ndarray(
-                            format="rgb24"
-                        )
-
-                        # ==================================
-                        # QUALITY CHECKS
-                        # ==================================
-
-                        for track in tracks:
-
-                            box = track.box()
-
-                            if (
-                                track.last_detection_frame
-                                == frame_number
-                            ):
-
-                                occlusion = max(
-                                    (
-                                        calculate_iou(
-                                            box,
-                                            other.box()
-                                        )
-                                        for other in tracks
-                                        if other is not track
-                                    ),
-                                    default=0
-                                )
-
-                                quality = (
-                                    assess_face_quality(
-                                        rgb,
-                                        box,
-                                        occlusion
-                                    )
-                                )
-
-                                if quality:
-
-                                    counters[
-                                        "quality_checked"
-                                    ] += 1
-
-                                    if quality["eligible"]:
-
-                                        counters[
-                                            "quality_eligible"
-                                        ] += 1
-
-                                    update_best_frames(
-                                        track,
-                                        quality,
-                                        frame_number
-                                    )
-
-                            tracking_rows.append([
-                                frame_number,
-                                round(
-                                    frame_number / fps,
-                                    3
-                                ),
-                                track.id,
-                                *[
-                                    round(
-                                        float(value),
-                                        2
-                                    )
-                                    for value in box
-                                ],
-                                round(
-                                    track.confidence,
-                                    3
-                                ),
-                                track.missed
-                            ])
-
-                        # ==================================
-                        # DRAW BOXES
-                        # ==================================
-
-                        image = Image.fromarray(
-                            rgb
-                        )
-
-                        draw = ImageDraw.Draw(
-                            image
-                        )
-
-                        for track in tracks:
-
-                            x1, y1, x2, y2 = [
-                                int(value)
-                                for value in track.box()
-                            ]
-
-                            x1 = max(0, x1)
-                            y1 = max(0, y1)
-
-                            x2 = min(
-                                image.width - 1,
-                                x2
-                            )
-
-                            y2 = min(
-                                image.height - 1,
-                                y2
-                            )
-
-                            if (
-                                x2 <= x1
-                                or y2 <= y1
-                            ):
-                                continue
-
-                            draw.rectangle(
-                                (
-                                    x1,
-                                    y1,
-                                    x2,
-                                    y2
-                                ),
-                                outline="#00ff66",
-                                width=3
-                            )
-
-                            draw.text(
-                                (
-                                    x1,
-                                    max(0, y1 - 15)
-                                ),
-                                f"ID {track.id}",
-                                fill="#00ff66",
-                                stroke_width=1,
-                                stroke_fill="black"
-                            )
-
-                        counters[
-                            "processed_frames"
-                        ] += 1
-
-                        counters[
-                            "drawn_boxes"
-                        ] += len(tracks)
-
-                        counters[
-                            "maximum_visible_tracks"
-                        ] = max(
-                            counters[
-                                "maximum_visible_tracks"
-                            ],
-                            len(tracks)
-                        )
-
-                        # ==================================
-                        # OPTIONAL RECORDING
-                        # ==================================
-
-                        if video_out is not None:
-
-                            output_frame = (
-                                av.VideoFrame.from_ndarray(
-                                    np.asarray(image),
-                                    format="rgb24"
-                                )
-                            )
-
-                            for packet in (
-                                output_stream.encode(
-                                    output_frame
-                                )
-                            ):
-                                video_out.mux(
-                                    packet
-                                )
-
-                        frame_end = (
-                            time.perf_counter()
-                        )
-
-                        durations[
-                            "detection"
-                        ] += (
-                            detection_end
-                            - frame_start
-                        )
-
-                        durations[
-                            "tracking"
-                        ] += (
-                            tracking_end
-                            - detection_end
-                        )
-
-                        durations[
-                            "quality_draw_encode"
-                        ] += (
-                            frame_end
-                            - tracking_end
-                        )
-
-                        preview = image.copy()
-
-                        preview.thumbnail((
-                            PREVIEW_MAX_WIDTH,
-                            1000
-                        ))
-
-                        elapsed_frame = (
-                            frame_end
-                            - frame_start
-                        )
-
-                        message = (
-                            f"Input FPS: {fps:.1f} | "
-                            f"Frame time: "
-                            f"{elapsed_frame * 1000:.1f} ms | "
-                            f"Tracks: {len(tracks)} | "
-                            f"IDs: {tracker.next_id - 1} | "
-                            f"Processed: "
-                            f"{counters['processed_frames']} | "
-                            f"Skipped: 0"
-                        )
-
-                        self.put(
-                            preview,
-                            message
-                        )
-
-                        if (
-                            counters[
-                                "processed_frames"
-                            ] % 100 == 0
-                        ):
-
-                            print(
-                                "Processed",
-                                counters[
-                                    "processed_frames"
-                                ],
-                                "frames | Skipped: 0"
-                            )
-
-                    if video_out is not None:
-
-                        for packet in (
-                            output_stream.encode()
-                        ):
-                            video_out.mux(
-                                packet
-                            )
-
-                finally:
-
-                    source.close()
-
-                    if video_out is not None:
-                        video_out.close()
-
-                total_time = (
-                    time.perf_counter()
-                    - start
-                )
-
-                # ==================================
-                # SAVE BEST FACE IMAGES
-                # ==================================
-
-                best_directory = (
-                    OUTPUT_DIR
-                    / f"best_faces_run_{run_number}"
-                )
-
-                best_directory.mkdir(
-                    parents=True,
-                    exist_ok=True
-                )
-
-                saved_faces = 0
-
-                for track in tracker.all_tracks:
-
-                    if not track.confirmed:
-                        continue
-
-                    for rank, item in enumerate(
-                        track.best_frames,
-                        start=1
-                    ):
-
-                        filename = (
-                            best_directory
-                            / (
-                                f"id_{track.id:03d}_"
-                                f"rank_{rank}_"
-                                f"frame_{item['frame']}.jpg"
-                            )
-                        )
-
-                        Image.fromarray(
-                            item["crop"]
-                        ).save(
-                            filename,
-                            quality=92
-                        )
-
-                        saved_faces += 1
-
-                # ==================================
-                # SAVE TRACKING CSV
-                # ==================================
-
-                csv_path = (
-                    OUTPUT_DIR
-                    / f"tracks_run_{run_number}.csv"
-                )
-
-                with csv_path.open(
-                    "w",
-                    newline="",
-                    encoding="utf-8"
-                ) as file:
-
-                    writer = csv.writer(
-                        file
+                    status = (
+                        f"FPS: {effective_fps:.2f} | "
+                        f"Faces: {len(tracks)} | "
+                        f"Frames: {processed} | "
+                        f"Skipped: {decoded - processed}"
                     )
 
-                    writer.writerow([
-                        "frame",
-                        "time_seconds",
-                        "track_id",
-                        "x1",
-                        "y1",
-                        "x2",
-                        "y2",
-                        "confidence",
-                        "missed_frames"
-                    ])
+                    if not self.put(image, status):
+                        break
 
-                    writer.writerows(
-                        tracking_rows
+            total_time = (
+                time.perf_counter() - start
+            )
+
+            best_dir = OUTPUT_DIR / "best_faces"
+
+            best_dir.mkdir(exist_ok=True)
+
+            saved_faces = 0
+
+            for track in tracker.all_tracks:
+
+                if not track.confirmed:
+                    continue
+
+                for rank, item in enumerate(
+                    track.best_frames, 1
+                ):
+
+                    filename = (
+                        f"id_{track.id:03d}_"
+                        f"rank_{rank}_"
+                        f"frame_{item['frame']}.jpg"
                     )
 
-                # ==================================
-                # SAVE REPORT
-                # ==================================
-
-                processed = counters[
-                    "processed_frames"
-                ]
-
-                report = {
-                    "run": run_number,
-                    "input_fps": fps,
-                    "processed_frames": processed,
-                    "skipped_frames": 0,
-                    "total_time_seconds": round(
-                        total_time,
-                        3
-                    ),
-                    "effective_processing_fps": round(
-                        processed
-                        / max(total_time, 1e-9),
-                        2
-                    ),
-                    "detection_runs": counters[
-                        "detection_frames"
-                    ],
-                    "track_ids_created": (
-                        tracker.next_id - 1
-                    ),
-                    "confirmed_tracks": sum(
-                        track.confirmed
-                        for track in tracker.all_tracks
-                    ),
-                    "successful_matches": (
-                        tracker.matches
-                    ),
-                    "recoveries": (
-                        tracker.recoveries
-                    ),
-                    "expired_tracks": (
-                        tracker.expired
-                    ),
-                    "maximum_visible_tracks": (
-                        counters[
-                            "maximum_visible_tracks"
-                        ]
-                    ),
-                    "quality_checked": counters[
-                        "quality_checked"
-                    ],
-                    "quality_eligible": counters[
-                        "quality_eligible"
-                    ],
-                    "best_face_images_saved": (
-                        saved_faces
-                    ),
-                    "average_ms_per_frame": {
-                        key: round(
-                            value * 1000
-                            / max(processed, 1),
-                            2
-                        )
-                        for key, value
-                        in durations.items()
-                    },
-                    "notes": [
-                        "No intentional frame skipping",
-                        "Every decoded frame tracked",
-                        "SCRFD detection every configured interval",
-                        "CPU only",
-                        "No OpenCV",
-                        "No face recognition",
-                        "Playback may be slower than real time"
-                    ]
-                }
-
-                report_path = (
-                    OUTPUT_DIR
-                    / f"report_run_{run_number}.json"
-                )
-
-                report_path.write_text(
-                    json.dumps(
-                        report,
-                        indent=2
-                    ),
-                    encoding="utf-8"
-                )
-
-                print()
-                print(
-                    "========== SCRFD RESULTS =========="
-                )
-
-                print(
-                    "Processed frames:",
-                    processed
-                )
-
-                print(
-                    "Skipped frames: 0"
-                )
-
-                print(
-                    "Detection runs:",
-                    counters[
-                        "detection_frames"
-                    ]
-                )
-
-                print(
-                    "Track IDs created:",
-                    tracker.next_id - 1
-                )
-
-                print(
-                    "Successful matches:",
-                    tracker.matches
-                )
-
-                print(
-                    "Total time:",
-                    round(total_time, 2),
-                    "seconds"
-                )
-
-                print(
-                    "Effective FPS:",
-                    report[
-                        "effective_processing_fps"
-                    ]
-                )
-
-                print(
-                    "Output directory:",
-                    OUTPUT_DIR
-                )
-
-                print(
-                    "==================================="
-                )
-
-                if not LOOP_VIDEO:
-
-                    self.put(
-                        None,
-                        (
-                            "Video completed. "
-                            f"Processed {processed} frames. "
-                            "Skipped: 0. "
-                            "Reports saved."
-                        )
+                    Image.fromarray(
+                        item["crop"]
+                    ).save(
+                        best_dir / filename,
+                        quality=93
                     )
 
-                    break
+                    saved_faces += 1
 
-        except Exception as error:
+            with open(
+                OUTPUT_DIR / "tracks.csv",
+                "w",
+                newline="",
+                encoding="utf-8"
+            ) as file:
+
+                writer = csv.writer(file)
+
+                writer.writerow([
+                    "frame",
+                    "track_id",
+                    "x1", "y1", "x2", "y2",
+                    "confidence"
+                ])
+
+                writer.writerows(rows)
+
+            report = {
+                "model": "SCRFD 10G",
+
+                "input_fps": fps,
+
+                "decoded_frames": decoded,
+
+                "processed_frames": processed,
+
+                "skipped_frames": decoded - processed,
+
+                "completed": not self.stop_event.is_set(),
+
+                "detection_runs": detection_runs,
+
+                "track_ids_created": tracker.next_id - 1,
+
+                "successful_matches": tracker.matches,
+
+                "best_faces_saved": saved_faces,
+
+                "total_time_seconds": round(total_time, 2),
+
+                "effective_fps": round(
+                    processed / max(total_time, 1e-6),
+                    2
+                ),
+
+                "average_detection_ms": round(
+                    detection_time * 1000
+                    / max(detection_runs, 1),
+                    2
+                ),
+
+                "average_inference_ms": round(
+                    detector.inference_time * 1000
+                    / max(detector.inference_count, 1),
+                    2
+                )
+            }
+
+            with open(
+                OUTPUT_DIR / "performance_report.json",
+                "w"
+            ) as file:
+
+                json.dump(
+                    report,
+                    file,
+                    indent=4
+                )
+
+            print("\n========== FINAL RESULTS ==========")
+
+            for key, value in report.items():
+
+                print(f"{key}: {value}")
 
             self.put(
                 None,
-                (
-                    f"ERROR: "
-                    f"{type(error).__name__}: "
-                    f"{error}"
-                )
+                f"Completed | Frames: {processed}"
             )
 
-            print(
-                "ERROR:",
-                repr(error)
+        except Exception as error:
+
+            print("ERROR:", repr(error))
+
+            self.put(
+                None,
+                f"ERROR: {error}"
             )
 
     def refresh(self):
 
         try:
 
-            # Display queued frames in order.
-            # No preview frames discarded.
-            image, message = (
-                self.frames.get_nowait()
-            )
+            image, status = self.frames.get_nowait()
 
             if image is not None:
 
-                self.photo = (
-                    ImageTk.PhotoImage(
-                        image
-                    )
-                )
+                self.photo = ImageTk.PhotoImage(image)
 
-                self.image_label.configure(
+                self.label.configure(
                     image=self.photo
                 )
 
+                self.displayed += 1
+
             self.status.configure(
-                text=message
+                text=(
+                    f"{status} | "
+                    f"Displayed: {self.displayed}"
+                )
             )
 
         except queue.Empty:
+
             pass
 
         if not self.stop_event.is_set():
 
-            self.root.after(
-                10,
-                self.refresh
-            )
+            self.root.after(5, self.refresh)
 
     def close(self):
 
         self.stop_event.set()
-
-        self.root.destroy()
+        self.root.quit()
 
     def run(self):
 
         self.root.mainloop()
 
+        self.stop_event.set()
+
+        self.worker.join()
+
+        self.root.destroy()
+
 
 # ==========================================
-# 11. MAIN
+# MAIN
 # ==========================================
 
 if __name__ == "__main__":
 
-    if not VIDEO_PATH.is_file():
+    if not VIDEO_PATH.exists():
 
-        raise FileNotFoundError(
-            f"Input video not found: "
-            f"{VIDEO_PATH}"
-        )
-
-    print(
-        "SCRFD LIVE PREVIEW - NO FRAME SKIPPING"
-    )
-
-    print(
-        "Video:",
-        VIDEO_PATH
-    )
-
-    print(
-        "Model:",
-        MODEL_PATH
-    )
-
-    print(
-        "Detection interval:",
-        DETECTION_INTERVAL
-    )
-
-    
+        raise FileNotFoundError(VIDEO_PATH)
 
     LivePreview().run()

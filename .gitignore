@@ -1,12 +1,6 @@
-# Python environment
 .venv/
 __pycache__/
 *.pyc
-
-# Generated outputs
-videos/live_results/
-videos/scrfd_*.mp4
-videos/output_*.mp4
-
-# Temporary files
 .vscode/
+
+videos/live_results/

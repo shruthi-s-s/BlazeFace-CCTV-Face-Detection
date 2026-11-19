@@ -1,0 +1,6 @@
+{
+    "USE_RGB_INPUT": true,
+    "ENABLE_CLAHE": false,
+    "HIGH_CONF": 0.7,
+    "NMS_THRESHOLD": 0.3
+}

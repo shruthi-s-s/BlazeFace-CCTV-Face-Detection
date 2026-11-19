@@ -1,4 +1,3 @@
-
 from pathlib import Path
 from fractions import Fraction
 import csv
